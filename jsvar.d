@@ -44,6 +44,8 @@
 */
 module arsd.jsvar;
 
+version=new_std_json;
+
 import std.stdio;
 import std.traits;
 import std.conv;
@@ -796,6 +798,12 @@ struct var {
 				return T.init;
 			//break;
 		}
+	}
+
+	public T nullCoalesce(T)(T t) {
+		if(_type == Type.Object && _payload._object is null)
+			return t;
+		return this.get!T;
 	}
 
 	public int opCmp(T)(T t) {
