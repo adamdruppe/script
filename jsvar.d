@@ -41,6 +41,20 @@
 	Also, if you combine this with my new arsd.script module, you get pretty
 	easy interop with a little scripting language that resembles a cross between
 	D and Javascript - just like you can write in D itself using this type.
+
+
+	Properties:
+		* note that @property doesn't work right in D, so the opDispatch properties
+		  will require double parenthesis to call as functions.
+
+		* Properties inside a var itself are set specially:
+			obj.propName._object = new PropertyPrototype(getter, setter);
+
+	D structs can be turned to vars, but it is a copy.
+
+	Wrapping D native objects is coming later, the current ways suck. I really needed
+	properties to do them sanely at all, and now I have it. A native wrapped object will
+	also need to be set with _object prolly.
 */
 module arsd.jsvar;
 
@@ -168,7 +182,7 @@ writeln(interpret("x*x + 3*x;", var(["x":3])));
 	};
 
 	// call D defined functions in script
-	globals.func =  (var a, var b) { writeln("Hello, world! You are : ", a, " and ", b); };
+	globals.func = (var a, var b) { writeln("Hello, world! You are : ", a, " and ", b); };
 
 	globals.ex = () { throw new ScriptRuntimeException("test", 1); };
 
@@ -547,7 +561,7 @@ struct var {
 		} else if(this.payloadType() == Type.Object && this._payload._object !is null) {
 			// FIXME: if it offers input range primitives, we should use them
 			// FIXME: user defined opApply on the object
-			foreach(k, ref v; this._payload._object._properties)
+			foreach(k, ref v; this._payload._object)
 				if(auto result = dg(var(k), v))
 					return result;
 		} else if(this.payloadType() == Type.String) {
@@ -613,7 +627,7 @@ struct var {
 			this._type = Type.String;
 			this._payload._string = to!string(t);
 		} else static if((is(T == class) || is(T == struct) || isAssociativeArray!T)) {
-			this,_type = Type.Object;
+			this._type = Type.Object;
 			auto obj = new PrototypeObject();
 			this._payload._object = obj;
 
@@ -636,8 +650,9 @@ struct var {
 			this._type = Type.Array;
 			var[] arr;
 			arr.length = t.length;
-			foreach(i, item; t)
-				arr[i] = var(item);
+			static if(!is(T == void[])) // we can't append a void array but it is nice to support x = [];
+				foreach(i, item; t)
+					arr[i] = var(item);
 			this._payload._array = arr;
 		} else static if(is(T == bool)) {
 			this._type = Type.Boolean;
@@ -645,6 +660,10 @@ struct var {
 		}
 
 		return this;
+	}
+
+	public size_t opDollar() {
+		return this.length().get!size_t;
 	}
 
 	public var opOpAssign(string op, T)(T t) {
@@ -688,6 +707,11 @@ struct var {
 		if(this.payloadType() == Type.Function) {
 			assert(this._payload._function !is null);
 			return this._payload._function(_this, args);
+		} else if(this.payloadType() == Type.Object) {
+			assert(this._payload._object !is null);
+			var* operator = this._payload._object._peekMember("opCall", true);
+			if(operator !is null && operator._type == Type.Function)
+				return operator.apply(_this, args);
 		}
 
 		version(jsvar_throw)
@@ -716,6 +740,10 @@ struct var {
 	public T get(T)() if(!is(T == void)) {
 		static if(is(T == var)) {
 			return this;
+		} else static if(__traits(compiles, T(this))) {
+			return T(this);
+		} else static if(__traits(compiles, new T(this))) {
+			return new T(this);
 		} else
 		final switch(payloadType) {
 			case Type.Boolean:
@@ -748,9 +776,8 @@ struct var {
 					if(this._object !is null)
 						return this._object.toString();
 					return "null";
-				}
-
-				return T.init;
+				} else
+					return T.init;
 			case Type.Integral:
 				static if(isFloatingPoint!T || isIntegral!T)
 					return to!T(this._payload._integral);
@@ -766,11 +793,12 @@ struct var {
 				else
 					return T.init;
 			case Type.String:
-				static if(__traits(compiles, to!T(this._payload._string)))
+				static if(__traits(compiles, to!T(this._payload._string))) {
 					try {
 						return to!T(this._payload._string);
-					} catch (Exception e) {}
-				return T.init;
+					} catch (Exception e) { return T.init; }
+				} else
+					return T.init;
 			case Type.Array:
 				import std.range;
 				auto pl = this._payload._array;
@@ -786,16 +814,15 @@ struct var {
 					foreach(item; pl)
 						ret ~= item.get!(getType);
 					return ret;
-				}
-
+				} else
+					return T.init;
 				// is it sane to translate anything else?
-
-				return T.init;
 			case Type.Function:
 				static if(isSomeString!T)
 					return "<function>";
+				else
+					return T.init;
 				// FIXME: we just might be able to do better for both of these
-				return T.init;
 			//break;
 		}
 	}
@@ -955,6 +982,12 @@ struct var {
 			return *tmp;
 		}
 
+		if(name == "toJson") {
+			var* tmp = new var;
+			*tmp = to!string(this.toJson());
+			return *tmp;
+		}
+
 		if(name == "length" && this.payloadType() == Type.String) {
 			var* tmp = new var;
 			*tmp = _payload._string.length;
@@ -1076,12 +1109,18 @@ struct var {
 		return v;
 	}
 
+	@property PrototypeObject prototypeObject() {
+		var v = prototype();
+		if(v._type == Type.Object)
+			return v._payload._object;
+		return null;
+	}
+
 	// what I call prototype is more like what Mozilla calls __proto__, but tbh I think this is better so meh
 	@property ref var prototype() {
 		static var _arrayPrototype;
 		static var _functionPrototype;
 		static var _stringPrototype;
-
 
 		final switch(payloadType()) {
 			case Type.Array:
@@ -1091,7 +1130,6 @@ struct var {
 				}
 
 				return _arrayPrototype;
-			break;
 			case Type.Function:
 				assert(_functionPrototype._type == Type.Object);
 				if(_functionPrototype._payload._object is null) {
@@ -1099,15 +1137,26 @@ struct var {
 				}
 
 				return _functionPrototype;
-			break;
 			case Type.String:
 				assert(_stringPrototype._type == Type.Object);
 				if(_stringPrototype._payload._object is null) {
-					_stringPrototype._object = new PrototypeObject();
+					auto p = new PrototypeObject();
+					_stringPrototype._object = p;
+
+					var replaceFunction;
+					replaceFunction._type = Type.Function;
+					replaceFunction._function = (var _this, var[] args) {
+						string s = _this.toString();
+						import std.array : replace;
+						return var(std.array.replace(s,
+							args[0].toString(),
+							args[1].toString()));
+					};
+
+					p._properties["replace"] = replaceFunction;
 				}
 
 				return _stringPrototype;
-			break;
 			case Type.Object:
 				if(_payload._object)
 					return _payload._object._prototype;
@@ -1118,6 +1167,7 @@ struct var {
 			case Type.Boolean:
 				// these types don't have prototypes
 		}
+
 
 		var* v = new var(null);
 		return *v;
@@ -1200,10 +1250,7 @@ struct var {
 					if(_payload._object is null) {
 						val = null;
 					} else {
-						JSONValue[string] tmp;
-						foreach(k, v; _payload._object._properties)
-							tmp[k] = v.toJsonValue();
-						val = tmp;
+						val = _payload._object.toJsonValue();
 					}
 				} else {
 					if(_payload._object is null) {
@@ -1480,8 +1527,14 @@ class PrototypeObject {
 	/*package*/ ref var _getMember(string name, bool recurse, bool throwOnFailure, string file = __FILE__, size_t line = __LINE__) {
 		var* mem = _peekMember(name, recurse);
 
-		if(mem !is null)
+		if(mem !is null) {
+			// If it is a property, we need to call the getter on it
+			if((*mem).payloadType == var.Type.Object && cast(PropertyPrototype) (*mem)._payload._object) {
+				auto prop = cast(PropertyPrototype) (*mem)._payload._object;
+				return prop.get;
+			}
 			return *mem;
+		}
 
 		mem = _peekMember("opIndex", recurse);
 		if(mem !is null) {
@@ -1503,6 +1556,11 @@ class PrototypeObject {
 		var* mem = _peekMember(name, recurse);
 
 		if(mem !is null) {
+			// Property check - the setter should be proxied over to it
+			if((*mem).payloadType == var.Type.Object && cast(PropertyPrototype) (*mem)._payload._object) {
+				auto prop = cast(PropertyPrototype) (*mem)._payload._object;
+				return prop.set(t);
+			}
 			*mem = t;
 			return *mem;
 		}
@@ -1523,6 +1581,56 @@ class PrototypeObject {
 		return this._properties[name];
 	}
 
+	JSONValue toJsonValue() {
+		JSONValue val;
+		JSONValue[string] tmp;
+		foreach(k, v; this._properties)
+			tmp[k] = v.toJsonValue();
+		val = tmp;
+		return val;
+	}
+
+	public int opApply(scope int delegate(var, ref var) dg) {
+		foreach(k, v; this._properties) {
+			if(v.payloadType == var.Type.Object && cast(PropertyPrototype) v._payload._object)
+				v = (cast(PropertyPrototype) v._payload._object).get;
+			if(auto result = dg(var(k), v))
+				return result;
+		}
+		return 0;
+	}
+}
+
+// A property is a special type of object that can only be set by assigning
+// one of these instances to foo.child._object. When foo.child is accessed and it
+// is an instance of PropertyPrototype, it will return the getter. When foo.child is
+// set (excluding direct assignments through _type), it will call the setter.
+class PropertyPrototype : PrototypeObject {
+	var delegate() getter;
+	void delegate(var) setter;
+	this(var delegate() getter, void delegate(var) setter) {
+		this.getter = getter;
+		this.setter = setter;
+	}
+
+	override string toString() {
+		return get.toString();
+	}
+
+	ref var get() {
+		var* g = new var();
+		*g = getter();
+		return *g;
+	}
+
+	ref var set(var t) {
+		setter(t);
+		return get;
+	}
+
+	override JSONValue toJsonValue() {
+		return get.toJsonValue();
+	}
 }
 
 

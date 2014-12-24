@@ -1,4 +1,11 @@
 /**
+   FIXME: easier object interop with D
+   FIXME: prettier stack trace when sent to D
+
+   FIXME: add continuations or something too
+
+   FIXME: Also ability to get source code for function something so you can mixin.
+
 	Script features:
 
 	FIXME: add COM support on Windows
@@ -104,6 +111,11 @@
 		args can say var if you want, but don't have to
 		default arguments supported in any position
 		when calling, you can use the default keyword to use the default value in any position
+	* macros:
+		A macro is defined just like a function, except with the
+		macro keyword instead of the function keyword. The difference
+		is a macro must interpret its own arguments - it is passed
+		AST objects instead of values. Still a WIP.
 
 
 
@@ -172,7 +184,7 @@ private enum string[] keywords = [
 	"__FILE__", "__LINE__", // these two are special to the lexer
 	"foreach", "json!q{", "default", "finally",
 	"return", "static", "struct", "import", "module", "assert", "switch",
-	"while", "catch", "throw", "scope", "break", "super", "class", "false", "mixin", "super",
+	"while", "catch", "throw", "scope", "break", "super", "class", "false", "mixin", "super", "macro",
 	"auto", // provided as an alias for var right now, may change later
 	"null", "else", "true", "eval", "goto", "enum", "case", "cast",
 	"var", "for", "try", "new",
@@ -340,17 +352,39 @@ class TokenStream(TextStream) {
 				token.type = ScriptToken.Type.string;
 				int pos = 1; // skip the opening "
 				bool escaped = false;
+				bool mustCopy = false;
 				// FIXME: escaping doesn't do the right thing lol. we should slice if we can, copy if not
 				while(pos < text.length && (escaped || text[pos] != '"')) {
-					if(escaped)
+					if(escaped) {
+						mustCopy = true;
 						escaped = false;
-					else
+					} else
 						if(text[pos] == '\\')
 							escaped = true;
 					pos++;
 				}
 
-				token.str = text[1 .. pos];
+				if(mustCopy) {
+					// there must be something escaped in there, so we need
+					// to copy it and properly handle those cases
+					string copy;
+					copy.reserve(pos);
+
+					escaped = false;
+					foreach(dchar ch; text[1 .. pos]) {
+						if(escaped)
+							escaped = false;
+						else if(ch == '\\') {
+							escaped = true;
+							continue;
+						}
+						copy ~= ch;
+					}
+
+					token.str = copy;
+				} else {
+					token.str = text[1 .. pos];
+				}
 				advance(pos + 1); // skip the closing " too
 			} else {
 				// let's check all symbols
@@ -412,6 +446,54 @@ TokenStream!TextStream lexScript(TextStream)(TextStream textStream, string scrip
 	return new TokenStream!TextStream(textStream, scriptFilename);
 }
 
+class MacroPrototype : PrototypeObject {
+	var func;
+
+	// macros are basically functions that get special treatment for their arguments
+	// they are passed as AST objects instead of interpreted
+	// calling an AST object will interpret it in the script
+	this(var func) {
+		this.func = func;
+		this._properties["opCall"] = (var _this, var[] args) {
+			return func.apply(_this, args);
+		};
+	}
+}
+
+alias helper(alias T) = T;
+// alternative to virtual function for converting the expression objects to script objects
+void addChildElementsOfExpressionToScriptExpressionObject(ClassInfo c, Expression _thisin, PrototypeObject sc, ref var obj) {
+	foreach(itemName; __traits(allMembers, mixin(__MODULE__)))
+	static if(__traits(compiles, __traits(getMember, mixin(__MODULE__), itemName))) {
+		alias Class = helper!(__traits(getMember, mixin(__MODULE__), itemName));
+		static if(is(Class : Expression)) if(c == typeid(Class)) {
+			auto _this = cast(Class) _thisin;
+			foreach(memberName; __traits(allMembers, Class)) {
+				alias member = helper!(__traits(getMember, Class, memberName));
+
+				static if(is(typeof(member) : Expression)) {
+					auto lol = __traits(getMember, _this, memberName);
+					if(lol is null)
+						obj[memberName] = null;
+					else
+						obj[memberName] = lol.toScriptExpressionObject(sc);
+				}
+				static if(is(typeof(member) : Expression[])) {
+					obj[memberName] = var.emptyArray;
+					foreach(m; __traits(getMember, _this, memberName))
+						if(m !is null)
+							obj[memberName] ~= m.toScriptExpressionObject(sc);
+						else
+							obj[memberName] ~= null;
+				}
+				static if(is(typeof(member) : string) || is(typeof(member) : long) || is(typeof(member) : real) || is(typeof(member) : bool)) {
+					obj[memberName] = __traits(getMember, _this, memberName);
+				}
+			}
+		}
+	}
+}
+
 struct InterpretResult {
 	var value;
 	PrototypeObject sc;
@@ -422,6 +504,33 @@ struct InterpretResult {
 
 class Expression {
 	abstract InterpretResult interpret(PrototypeObject sc);
+
+	// this returns an AST object that can be inspected and possibly altered
+	// by the script. Calling the returned object will interpret the object in
+	// the original scope passed
+	var toScriptExpressionObject(PrototypeObject sc) {
+		var obj = var.emptyObject;
+
+		obj["type"] = typeid(this).name;
+		obj["toSourceCode"] = (var _this, var[] args) {
+			Expression e = this;
+			// FIXME: if they changed the properties in the
+			// script, we should update them here too.
+			return var(e.toString());
+		};
+		obj["opCall"] = (var _this, var[] args) {
+			Expression e = this;
+			// FIXME: if they changed the properties in the
+			// script, we should update them here too.
+			return e.interpret(sc).value;
+		};
+
+		// adding structure is going to be a little bit magical
+		// I could have done this with a virtual function, but I'm lazy.
+		addChildElementsOfExpressionToScriptExpressionObject(typeid(this), this, sc, obj);
+
+		return obj;
+	}
 }
 
 class MixinExpression : Expression {
@@ -608,7 +717,7 @@ class FunctionLiteralExpression : Expression {
 	}
 
 	override string toString() {
-		string s = "function (";
+		string s = (isMacro ? "macro" : "function") ~ " (";
 		s ~= arguments.toString();
 
 		s ~= ") ";
@@ -630,6 +739,8 @@ class FunctionLiteralExpression : Expression {
 	Expression functionBody; // can be a ScopeExpression btw
 
 	PrototypeObject lexicalScope;
+
+	bool isMacro;
 
 	override InterpretResult interpret(PrototypeObject sc) {
 		assert(DefaultArgumentDummyObject !is null);
@@ -666,6 +777,11 @@ class FunctionLiteralExpression : Expression {
 				assert(0);
 			}
 		};
+		if(isMacro) {
+			var n = var.emptyObject;
+			n._object = new MacroPrototype(v);
+			v = n;
+		}
 		return InterpretResult(v, sc);
 	}
 }
@@ -1144,6 +1260,22 @@ class ForExpression : Expression {
 
 		return InterpretResult(result, sc, flowControl);
 	}
+
+	override string toString() {
+		string code = "for(";
+		if(initialization !is null)
+			code ~= initialization.toString();
+		code ~= "; ";
+		if(condition !is null)
+			code ~= condition.toString();
+		code ~= "; ";
+		if(advancement !is null)
+			code ~= advancement.toString();
+		code ~= ") ";
+		code ~= loopBody.toString();
+
+		return code;
+	}
 }
 
 class IfExpression : Expression {
@@ -1168,6 +1300,19 @@ class IfExpression : Expression {
 				result = ifFalse.interpret(ifScope);
 		}
 		return InterpretResult(result.value, sc, result.flowControl);
+	}
+
+	override string toString() {
+		string code = "if(";
+		code ~= condition.toString();
+		code ~= ") ";
+		if(ifTrue !is null)
+			code ~= ifTrue.toString();
+		else
+			code ~= " { }";
+		if(ifFalse !is null)
+			code ~= " else " ~ ifFalse.toString();
+		return code;
 	}
 }
 
@@ -1320,10 +1465,14 @@ class CallExpression : Expression {
 
 	override InterpretResult interpret(PrototypeObject sc) {
 		auto f = func.interpret(sc).value;
+		bool isMacro =  (f.payloadType == var.Type.Object && ((cast(MacroPrototype) f._payload._object) !is null));
 		var[] args;
 		foreach(argument; arguments)
 			if(argument !is null) {
-				args ~= argument.interpret(sc).value;
+				if(isMacro) // macro, pass the argument as an expression object
+					args ~= argument.toScriptExpressionObject(sc);
+				else // regular function, interpret the arguments
+					args ~= argument.interpret(sc).value;
 			} else {
 				if(DefaultArgumentDummyObject is null)
 					DefaultArgumentDummyObject = new PrototypeObject();
@@ -1471,7 +1620,7 @@ Expression parsePart(MyTokenStreamHere)(ref MyTokenStreamHere tokens) {
 						obj.elements[key.str] = value;
 
 						goto moreKeys;
-					break;
+					case "macro":
 					case "function":
 						tokens.requireNextToken(ScriptToken.Type.symbol, "(");
 
@@ -1482,6 +1631,7 @@ Expression parsePart(MyTokenStreamHere)(ref MyTokenStreamHere tokens) {
 						tokens.requireNextToken(ScriptToken.Type.symbol, ")");
 
 						exp.functionBody = parseExpression(tokens);
+						exp.isMacro = token.str == "macro";
 
 						e = exp;
 					break;
@@ -1969,7 +2119,7 @@ Expression parseExpression(MyTokenStreamHere)(ref MyTokenStreamHere tokens, bool
 			ret = parseAddend(tokens);
 	} else {
 		assert(0);
-		return null;
+		// return null;
 	//	throw new ScriptCompileException("Parse error, unexpected end of input when reading expression", token.lineNumber);
 	}
 
@@ -2067,6 +2217,7 @@ Expression parseStatement(MyTokenStreamHere)(ref MyTokenStreamHere tokens, strin
 					goto skip;
 				// literals
 				case "function":
+				case "macro":
 					// function can be a literal, or a declaration.
 
 					tokens.popFront(); // we're peeking ahead
@@ -2091,6 +2242,8 @@ Expression parseStatement(MyTokenStreamHere)(ref MyTokenStreamHere tokens, strin
 						auto e = new VariableDeclaration();
 						e.identifiers ~= ident.str;
 						e.initializers ~= exp;
+
+						exp.isMacro = token.str == "macro";
 
 						return e;
 
@@ -2140,13 +2293,12 @@ Expression parseStatement(MyTokenStreamHere)(ref MyTokenStreamHere tokens, strin
 					// whatever else keyword or operator related is actually illegal here
 					throw new ScriptCompileException("Parse error, unexpected " ~ token.str, token.lineNumber);
 			}
-		break;
+		// break;
 		case ScriptToken.Type.identifier:
 		case ScriptToken.Type.string:
 		case ScriptToken.Type.int_number:
 		case ScriptToken.Type.float_number:
 			return parseExpression(tokens);
-		break;
 	}
 
 	assert(0);
