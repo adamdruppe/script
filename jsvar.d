@@ -61,6 +61,7 @@ module arsd.jsvar;
 version=new_std_json;
 
 import std.stdio;
+static import std.array;
 import std.traits;
 import std.conv;
 import std.json;
@@ -497,6 +498,7 @@ private var _op(alias _this, alias this2, string op, T)(T t) if(op != "~") {
 }
 
 
+///
 struct var {
 	public this(T)(T t) {
 		static if(is(T == var))
@@ -626,12 +628,22 @@ struct var {
 		} else static if(isSomeString!T) {
 			this._type = Type.String;
 			this._payload._string = to!string(t);
-		} else static if((is(T == class) || is(T == struct) || isAssociativeArray!T)) {
+		} else static if(is(T : PrototypeObject)) {
+			// support direct assignment of pre-made implementation objects
+			// so prewrapped stuff can be easily passed.
+			this._type = Type.Object;
+			this._payload._object = t;
+		} else static if(is(T == class)) {
+			// auto-wrap other classes with reference semantics
+			this._type = Type.Object;
+			this._payload._object = wrapNativeObject(t);
+		} else static if(is(T == struct) || isAssociativeArray!T) {
+			// copy structs and assoc arrays by value into a var object
 			this._type = Type.Object;
 			auto obj = new PrototypeObject();
 			this._payload._object = obj;
 
-			static if((is(T == class) || is(T == struct)))
+			static if(is(T == struct))
 			foreach(member; __traits(allMembers, T)) {
 				static if(__traits(compiles, __traits(getMember, t, member))) {
 					static if(is(typeof(__traits(getMember, t, member)) == function)) {
@@ -657,7 +669,14 @@ struct var {
 		} else static if(is(T == bool)) {
 			this._type = Type.Boolean;
 			this._payload._boolean = t;
-		}
+		} else static if(isSomeChar!T) {
+			this._type = Type.String;
+			this._payload._string = "";
+			import std.utf;
+			char[4] ugh;
+			auto size = encode(ugh, t);
+			this._payload._string = ugh[0..size].idup;
+		}// else static assert(0, "unsupported type");
 
 		return this;
 	}
@@ -674,6 +693,23 @@ struct var {
 		}
 
 		return _op!(this, this, op, T)(t);
+	}
+
+	public var opUnary(string op)() {
+		static assert(op == "-");
+		final switch(payloadType()) {
+			case Type.Object:
+			case Type.Array:
+			case Type.Boolean:
+			case Type.String:
+			case Type.Function:
+				assert(0); // FIXME
+			break;
+			case Type.Integral:
+				return var(-this.get!long);
+			case Type.Floating:
+				return var(-this.get!double);
+		}
 	}
 
 	public var opBinary(string op, T)(T t) {
@@ -708,7 +744,7 @@ struct var {
 			assert(this._payload._function !is null);
 			return this._payload._function(_this, args);
 		} else if(this.payloadType() == Type.Object) {
-			assert(this._payload._object !is null);
+			assert(this._payload._object !is null, this.toString());
 			var* operator = this._payload._object._peekMember("opCall", true);
 			if(operator !is null && operator._type == Type.Function)
 				return operator.apply(_this, args);
@@ -750,7 +786,7 @@ struct var {
 				static if(is(T == bool))
 					return this._payload._boolean;
 				else static if(isFloatingPoint!T || isIntegral!T)
-					return this._payload._boolean ? 1 : 0;
+					return cast(T) (this._payload._boolean ? 1 : 0); // the cast is for enums, I don't like this so FIXME
 				else static if(isSomeString!T)
 					return this._payload._boolean ? "true" : "false";
 				else
@@ -758,15 +794,36 @@ struct var {
 			case Type.Object:
 				static if(isAssociativeArray!T) {
 					T ret;
+					if(this._payload._object !is null)
 					foreach(k, v; this._payload._object._properties)
 						ret[to!(KeyType!T)(k)] = v.get!(ValueType!T);
 
 					return ret;
+				} else static if(is(T : PrototypeObject)) {
+					// they are requesting an implementation object, just give it to them
+					return cast(T) this._payload._object;
 				} else static if(is(T == struct) || is(T == class)) {
-					T t;
-					static if(is(T == class))
-						t = new T();
+					// first, we'll try to give them back the native object we have, if we have one
+					static if(is(T : Object)) {
+						if(auto wno = cast(WrappedNativeObject) this._payload._object) {
+							auto no = cast(T) wno.getObject();
+							if(no !is null)
+								return no;
+						}
+					}
 
+					// failing that, generic struct or class getting: try to fill in the fields by name
+					T t;
+					bool initialized = true;
+					static if(is(T == class)) {
+						static if(__traits(compiles, new T()))
+							t = new T();
+						else
+							initialized = false;
+					}
+
+
+					if(initialized)
 					foreach(i, a; t.tupleof) {
 						cast(Unqual!(typeof((a)))) t.tupleof[i] = this[t.tupleof[i].stringof[2..$]].get!(typeof(a));
 					}
@@ -820,7 +877,27 @@ struct var {
 			case Type.Function:
 				static if(isSomeString!T)
 					return "<function>";
-				else
+				else static if(isDelegate!T) {
+					// making a local copy because otherwise the delegate might refer to a struct on the stack and get corrupted later or something
+					auto func = this._payload._function;
+
+					// the static helper lets me pass specific variables to the closure
+					static T helper(typeof(func) func) {
+						return delegate ReturnType!T (ParameterTypeTuple!T args) {
+							var[] arr;
+							foreach(arg; args)
+								arr ~= var(arg);
+							var ret = func(var(null), arr);
+							static if(is(ReturnType!T == void))
+								return;
+							else
+								return ret.get!(ReturnType!T);
+						};
+					}
+
+					return helper(func);
+
+				} else
 					return T.init;
 				// FIXME: we just might be able to do better for both of these
 			//break;
@@ -846,8 +923,7 @@ struct var {
 		return this.opEquals(var(t));
 	}
 
-
-	public bool opEquals(T:var)(T t) {
+	public bool opEquals(T:var)(T t) const {
 		// FIXME: should this be == or === ?
 		if(this._type != t._type)
 			return false;
@@ -1035,8 +1111,12 @@ struct var {
 			from = pt._payload._object;
 		}
 
-		if(from is null)
-			throw new DynamicTypeException(var(null), Type.Object, file, line);
+		if(from is null) {
+			version(jsvar_throw)
+				throw new DynamicTypeException(var(null), Type.Object, file, line);
+			else
+				return *(new var);
+		}
 		return from._getMember(name, true, false, file, line);
 	}
 
@@ -1066,6 +1146,12 @@ struct var {
 			auto arr = this._payload._array;
 			if(idx < arr.length)
 				return arr[idx];
+		} else if(_type == Type.Object) {
+			// objects might overload opIndex
+			var* n = new var();
+			if("opIndex" in this)
+				*n = this["opIndex"](idx);
+			return *n;
 		}
 		version(jsvar_throw)
 			throw new DynamicTypeException(this, Type.Array, file, line);
@@ -1229,7 +1315,7 @@ struct var {
 
 	string toJson() {
 		auto v = toJsonValue();
-		return toJSON(&v);
+		return toJSON(v);
 	}
 
 	JSONValue toJsonValue() {
@@ -1306,125 +1392,6 @@ struct var {
 	}
 }
 
-// this doesn't really work
-class WrappedNativeObject(T, bool wrapData = true) : PrototypeObject {
-	T nativeObject;
-
-
-	auto makeWrapper(string member)() {
-		return (var _this, var[] args) {
-			auto func = &(__traits(getMember, nativeObject, member));
-			var ret;
-
-			// this is a filthy hack and i hate it
-			// the problem with overriding getMember though is we can't really control what happens when it is set, since that's all done through the ref, and we don't want to overload stuff there since it can be copied.
-			// so instead on each method call, I'll copy the data from the prototype back out... and then afterward, copy from the object back to the prototype. gross.
-
-			// first we need to make sure that the native object is updated...
-			static if(wrapData)
-				updateNativeObject();
-
-
-
-			ParameterTypeTuple!(func) fargs;
-			foreach(idx, a; fargs) {
-				if(idx == args.length)
-					break;
-				cast(Unqual!(typeof(a))) fargs[idx] = args[idx].get!(Unqual!(typeof(a)));
-			}
-
-			static if(is(ReturnType!func == void)) {
-				func(fargs);
-			} else {
-				ret = func(fargs);
-			}
-
-
-			// then transfer updates from it back here
-			static if(wrapData)
-				getUpdatesFromNativeObject();
-
-			return ret;
-		};
-	}
-
-
-	this(T t) {
-		this.name = T.stringof;
-		this.nativeObject = t;
-		// this.prototype = new PrototypeObject();
-
-		foreach(member; __traits(allMembers, T)) {
-			static if(__traits(compiles, __traits(getMember, nativeObject, member))) {
-				static if(is(typeof(__traits(getMember, nativeObject, member)) == function)) {
-					static if(__traits(getOverloads, nativeObject, member).length == 1)
-					this._getMember(member, false, false)._function =
-						makeWrapper!(member)();
-				} else static if(wrapData)
-					this._getMember(member, false, false) = __traits(getMember, nativeObject, member);
-			}
-		}
-	}
-
-	void updateNativeObject() {
-		foreach(member; __traits(allMembers, T)) {
-			static if(__traits(compiles, __traits(getMember, nativeObject, member))) {
-				static if(is(typeof(__traits(getMember, nativeObject, member)) == function)) {
-					// ignore, if these are overridden, we want it to stay that way
-				} else {
-					// if this doesn't compile, it is prolly cuz it is const or something
-					static if(__traits(compiles, this._getMember(member, false, false).putInto(__traits(getMember, nativeObject, member))))
-						this._getMember(member, false, false).putInto(__traits(getMember, nativeObject, member));
-				}
-			}
-		}
-	}
-
-	void getUpdatesFromNativeObject() {
-		foreach(member; __traits(allMembers, T)) {
-			static if(__traits(compiles, __traits(getMember, nativeObject, member))) {
-				static if(is(typeof(__traits(getMember, nativeObject, member)) == function)) {
-					// ignore, these won't change
-				} else {
-					this._getMember(member, false, false) = __traits(getMember, nativeObject, member);
-				}
-			}
-		}
-	}
-
-	override WrappedNativeObject!T copy() {
-		auto n = new WrappedNativeObject!T(nativeObject);
-		// FIXME: what if nativeObject is a reference type?
-		return n;
-	}
-}
-
-
-class OpaqueNativeObject(T) : PrototypeObject {
-	T item;
-
-	this(T t) {
-		this.item = t;
-	}
-
-	//override string toString() const {
-		//return item.toString();
-	//}
-
-	override OpaqueNativeObject!T copy() {
-		auto n = new OpaqueNativeObject!T(item);
-		// FIXME: what if it is a reference type?
-		return n;
-	}
-}
-
-T getOpaqueNative(T)(var v, string file = __FILE__, size_t line = __LINE__) {
-	auto obj = cast(OpaqueNativeObject!T) v._object;
-	if(obj is null)
-		throw new DynamicTypeException(v, var.Type.Object, file, line);
-	return obj.item;
-}
-
 class PrototypeObject {
 	string name;
 	var _prototype;
@@ -1463,7 +1430,7 @@ class PrototypeObject {
 				val.object[k] = v.toJsonValue();
 		}
 
-		return toJSON(&val);
+		return toJSON(val);
 	}
 
 	var[string] _properties;
@@ -1653,4 +1620,56 @@ template makeAscii() {
 	}
 
 	enum makeAscii = helper();
+}
+
+// just a base class we can reference when looking for native objects
+class WrappedNativeObject : PrototypeObject {
+	TypeInfo wrappedType;
+	abstract Object getObject();
+}
+
+template helper(alias T) { alias helper = T; }
+
+/// Wraps a class. If you are manually managing the memory, remember the jsvar may keep a reference to the object; don't free it!
+///
+/// To use this: var a = wrapNativeObject(your_d_object); OR var a = your_d_object;
+///
+/// By default, it will wrap all methods and members with a public or greater protection level. The second template parameter can filter things differently. FIXME implement this
+///
+/// That may be done automatically with opAssign in the future.
+WrappedNativeObject wrapNativeObject(Class)(Class obj) if(is(Class == class)) {
+	return new class WrappedNativeObject {
+		override Object getObject() {
+			return obj;
+		}
+
+		this() {
+			wrappedType = typeid(obj);
+			// wrap the other methods
+			// and wrap members as scriptable properties
+
+			foreach(memberName; __traits(allMembers, Class)) {
+				static if(is(typeof(__traits(getMember, obj, memberName)) type))
+				static if(is(typeof(__traits(getMember, obj, memberName)))) {
+					static if(is(type == function)) {
+						_properties[memberName] = &__traits(getMember, obj, memberName);
+					} else {
+						// if it has a type but is not a function, it is prolly a member
+						_properties[memberName] = new PropertyPrototype(
+							() => var(__traits(getMember, obj, memberName)),
+							(var v) {
+								__traits(getMember, obj, memberName) = v.get!(type);
+							});
+					}
+				}
+			}
+		}
+	};
+}
+
+/// Wraps a struct by reference. The pointer is stored - be sure the struct doesn't get freed or go out of scope!
+///
+/// BTW: structs by value can be put in vars with var.opAssign and var.get. It will generate an object with the same fields. The difference is changes to the jsvar won't be reflected in the original struct and native methods won't work if you do it that way.
+WrappedNativeObject wrapNativeObject(Struct)(Struct* obj) if(is(Struct == struct)) {
+	return null; // FIXME
 }

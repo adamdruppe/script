@@ -1,14 +1,13 @@
-/**
-   FIXME: easier object interop with D
-   FIXME: prettier stack trace when sent to D
+/++
+	A small script interpreter that is easily embedded inside and has easy two-way interop with the host D program.
+	The script language it implements is based on a hybrid of D and Javascript.
 
-   FIXME: add continuations or something too
+	The interpreter is slightly buggy and poorly documented, but the basic functionality works well and much of
+	your existing knowledge from Javascript will carry over, making it hopefully easy to use right out of the box.
+	See the [#examples] to quickly get the feel of the script language as well as the interop.
 
-   FIXME: Also ability to get source code for function something so you can mixin.
 
-	Script features:
-
-	FIXME: add COM support on Windows
+	Script_features:
 
 	OVERVIEW
 	* easy interop with D thanks to arsd.jsvar. When interpreting, pass a var object to use as globals.
@@ -17,8 +16,12 @@
 	* simple implementation is moderately small and fairly easy to hack on (though it gets messier by the day), but it isn't made for speed.
 
 	SPECIFICS
+	* Allows identifiers-with-dashes. To do subtraction, put spaces around the minus sign.
+	* Allows identifiers starting with a dollar sign.
+	* string literals come in "foo" or 'foo', like Javascript, or `raw string` like D. Also come as “nested “double quotes” are an option!”
 	* mixin aka eval (does it at runtime, so more like eval than mixin, but I want it to look like D)
 	* scope guards, like in D
+	* Built-in assert() which prints its source and its arguments
 	* try/catch/finally/throw
 		You can use try as an expression without any following catch to return the exception:
 
@@ -121,11 +124,91 @@
 
 	FIXME:
 		* make sure superclass ctors are called
+
+   FIXME: prettier stack trace when sent to D
+
+   FIXME: interpolated string: "$foo" or "#{expr}" or something.
+   FIXME: support more escape things in strings like \n, \t etc.
+
+   FIXME: add easy to use premade packages for the global object.
+
+   FIXME: maybe simplify the json!q{ } thing a bit.
+
+   FIXME: the debugger statement from javascript might be cool to throw in too.
+
+   FIXME: add continuations or something too
+
+   FIXME: Also ability to get source code for function something so you can mixin.
+   FIXME: add COM support on Windows
+
+
 	Might be nice:
 		varargs
-		lambdas
-*/
+		lambdas - maybe without function keyword and the x => foo syntax from D.
++/
 module arsd.script;
+
+/++
+	This example shows the basics of how to interact with the script.
+	The string enclosed in `q{ .. }` is the script language source.
+
+	The [var] type comes from [arsd.jsvar] and provides a dynamic type
+	to D. It is the same type used in the script language and is weakly
+	typed, providing operator overloads to work with many D types seamlessly.
+
+	However, if you do need to convert it to a static type, such as if passing
+	to a function, you can use `get!T` to get a static type out of it.
++/
+unittest {
+	var globals = var.emptyObject;
+	globals.x = 25; // we can set variables on the global object
+	globals.name = "script.d"; // of various types
+	// and we can make native functions available to the script
+	globals.sum = (int a, int b) {
+		return a + b;
+	};
+
+	// This is the source code of the script. It is similar
+	// to javascript with pieces borrowed from D, so should
+	// be pretty familiar.
+	string scriptSource = q{
+		function foo() {
+			return 13;
+		}
+
+		var a = foo() + 12;
+		assert(a == 25);
+
+		// you can also access the D globals from the script
+		assert(x == 25);
+		assert(name == "script.d");
+
+		// as well as call D functions set via globals:
+		assert(sum(5, 6) == 11);
+
+		// I will also set a function to call from D
+		function bar(str) {
+			// unlike Javascript though, we use the D style
+			// concatenation operator.
+			return str ~ " concatenation";
+		}
+	};
+	
+	// once you have the globals set up, you call the interpreter
+	// with one simple function.
+	interpret(scriptSource, globals);
+
+	// finally, globals defined from the script are accessible here too:
+	// however, notice the two sets of parenthesis: the first is because
+	// @property is broken in D. The second set calls the function and you
+	// can pass values to it.
+	assert(globals.foo()() == 13);
+
+	assert(globals.bar()("test") == "test concatenation");
+
+	// this shows how to convert the var back to a D static type.
+	int x = globals.x.get!int;
+}
 
 public import arsd.jsvar;
 
@@ -137,24 +220,29 @@ import std.json;
 import std.array;
 import std.range;
 
-/***************************************
+/* **************************************
   script to follow
 ****************************************/
 
+/// Thrown on script syntax errors and the sort.
 class ScriptCompileException : Exception {
 	this(string msg, int lineNumber, string file = __FILE__, size_t line = __LINE__) {
 		super(to!string(lineNumber) ~ ": " ~ msg, file, line);
 	}
 }
 
+/// Thrown on things like interpretation failures.
 class ScriptRuntimeException : Exception {
 	this(string msg, int lineNumber, string file = __FILE__, size_t line = __LINE__) {
 		super(to!string(lineNumber) ~ ": " ~ msg, file, line);
 	}
 }
 
+/// This represents an exception thrown by `throw x;` inside the script as it is interpreted.
 class ScriptException : Exception {
+	///
 	var payload;
+	///
 	int lineNumber;
 	this(var payload, int lineNumber, string file = __FILE__, size_t line = __LINE__) {
 		this.payload = payload;
@@ -215,7 +303,8 @@ class TokenStream(TextStream) {
 				break;
 			if(text[0] == '\n')
 				lineNumber ++;
-			text.popFront();
+			text = text[1 .. $];
+			// text.popFront(); // don't want this because it pops too much trying to do its own UTF-8, which we already handled!
 		}
 	}
 
@@ -339,6 +428,7 @@ class TokenStream(TextStream) {
 					while(pos < text.length
 						&& ((text[pos] >= 'a' && text[pos] <= 'z') ||
 							(text[pos] == '_') ||
+							(pos != 0 && text[pos] == '-') || // allow mid-identifier dashes for this-kind-of-name. For subtraction, add a space.
 							(text[pos] >= 'A' && text[pos] <= 'Z') ||
 							(text[pos] >= '0' && text[pos] <= '9')))
 					{
@@ -348,19 +438,44 @@ class TokenStream(TextStream) {
 					token.str = text[0 .. pos];
 					advance(pos);
 				}
-			} else if(text[0] == '"') {
+			} else if(text[0] == '"' || text[0] == '\'' || text[0] == '`' ||
+				// Also supporting double curly quoted strings: “foo” which nest. This is the utf 8 coding:
+				(text.length >= 3 && text[0] == 0xe2 && text[1] == 0x80 && text[2] == 0x9c)) 
+			{
+				char end = text[0]; // support single quote and double quote strings the same
+				int openCurlyQuoteCount = (end == 0xe2) ? 1 : 0;
+				bool escapingAllowed = end != '`'; // `` strings are raw, they don't support escapes. the others do.
 				token.type = ScriptToken.Type.string;
-				int pos = 1; // skip the opening "
+				int pos = openCurlyQuoteCount ? 3 : 1; // skip the opening dchar
+				int started = pos;
 				bool escaped = false;
 				bool mustCopy = false;
-				// FIXME: escaping doesn't do the right thing lol. we should slice if we can, copy if not
-				while(pos < text.length && (escaped || text[pos] != '"')) {
+
+				bool atEnd() {
+					if(openCurlyQuoteCount) {
+						if(openCurlyQuoteCount == 1)
+							return (pos + 3 <= text.length && text[pos] == 0xe2 && text[pos+1] == 0x80 && text[pos+2] == 0x9d); // ”
+						else // greater than one means we nest
+							return false;
+					} else
+						return text[pos] == end;
+				}
+
+				while(pos < text.length && (escaped || !atEnd())) {
 					if(escaped) {
 						mustCopy = true;
 						escaped = false;
-					} else
-						if(text[pos] == '\\')
+					} else {
+						if(text[pos] == '\\' && escapingAllowed)
 							escaped = true;
+						if(openCurlyQuoteCount) {
+							// also need to count curly quotes to support nesting
+							if(pos + 3 <= text.length && text[pos+0] == 0xe2 && text[pos+1] == 0x80 && text[pos+2] == 0x9c) // “
+								openCurlyQuoteCount++;
+							if(pos + 3 <= text.length && text[pos+0] == 0xe2 && text[pos+1] == 0x80 && text[pos+2] == 0x9d) // ”
+								openCurlyQuoteCount--;
+						}
+					}
 					pos++;
 				}
 
@@ -368,10 +483,10 @@ class TokenStream(TextStream) {
 					// there must be something escaped in there, so we need
 					// to copy it and properly handle those cases
 					string copy;
-					copy.reserve(pos);
+					copy.reserve(pos + 4);
 
 					escaped = false;
-					foreach(dchar ch; text[1 .. pos]) {
+					foreach(dchar ch; text[started .. pos]) {
 						if(escaped)
 							escaped = false;
 						else if(ch == '\\') {
@@ -383,9 +498,9 @@ class TokenStream(TextStream) {
 
 					token.str = copy;
 				} else {
-					token.str = text[1 .. pos];
+					token.str = text[started .. pos];
 				}
-				advance(pos + 1); // skip the closing " too
+				advance(pos + ((end == 0xe2) ? 3 : 1)); // skip the closing " too
 			} else {
 				// let's check all symbols
 				bool found = false;
@@ -531,6 +646,10 @@ class Expression {
 
 		return obj;
 	}
+
+	string toInterpretedString(PrototypeObject sc) {
+		return toString();
+	}
 }
 
 class MixinExpression : Expression {
@@ -570,7 +689,7 @@ class StringLiteralExpression : Expression {
 				continue;
 			}
 			if(inEscape) {
-				lastPos = pos + 1;
+				lastPos = cast(int) pos + 1;
 				inEscape = false;
 				switch(c) {
 					case 'n':
@@ -641,6 +760,16 @@ class NullLiteralExpression : Expression {
 	override InterpretResult interpret(PrototypeObject sc) {
 		var n;
 		return InterpretResult(n, sc);
+	}
+}
+class NegationExpression : Expression {
+	Expression e;
+	this(Expression e) { this.e = e;}
+	override string toString() { return "-" ~ e.toString(); }
+
+	override InterpretResult interpret(PrototypeObject sc) {
+		var n = e.interpret(sc).value;
+		return InterpretResult(-n, sc);
 	}
 }
 class ArrayLiteralExpression : Expression {
@@ -850,6 +979,10 @@ class BinaryExpression : Expression {
 		return e1.toString() ~ " " ~ op ~ " " ~ e2.toString();
 	}
 
+	override string toInterpretedString(PrototypeObject sc) {
+		return e1.toInterpretedString(sc) ~ " " ~ op ~ " " ~ e2.toInterpretedString(sc);
+	}
+
 	this(string op, Expression e1, Expression e2) {
 		this.op = op;
 		this.e1 = e1;
@@ -953,6 +1086,10 @@ class VariableExpression : Expression {
 
 	override string toString() {
 		return identifier;
+	}
+
+	override string toInterpretedString(PrototypeObject sc) {
+		return getVar(sc).get!string;
 	}
 
 	ref var getVar(PrototypeObject sc, bool recurse = true) {
@@ -1442,6 +1579,25 @@ class ParentheticalExpression : Expression {
 	}
 }
 
+class AssertKeyword : Expression {
+	ScriptToken token;
+	this(ScriptToken token) {
+		this.token = token;
+	}
+	override string toString() {
+		return "assert";
+	}
+
+	override InterpretResult interpret(PrototypeObject sc) {
+		if(AssertKeywordObject is null)
+			AssertKeywordObject = new PrototypeObject();
+		var dummy;
+		dummy._object = AssertKeywordObject;
+		return InterpretResult(dummy, sc);
+	}
+}
+
+PrototypeObject AssertKeywordObject;
 PrototypeObject DefaultArgumentDummyObject;
 
 class CallExpression : Expression {
@@ -1464,6 +1620,22 @@ class CallExpression : Expression {
 	}
 
 	override InterpretResult interpret(PrototypeObject sc) {
+		if(auto asrt = cast(AssertKeyword) func) {
+			auto assertExpression = arguments[0];
+			Expression assertString;
+			if(arguments.length > 1)
+				assertString = arguments[1];
+
+			var v = assertExpression.interpret(sc).value;
+
+			if(!v)
+				throw new ScriptException(
+					var(this.toString() ~ " failed, got: " ~ assertExpression.toInterpretedString(sc)),
+					asrt.token.lineNumber);
+
+			return InterpretResult(v, sc);
+		}
+
 		auto f = func.interpret(sc).value;
 		bool isMacro =  (f.payloadType == var.Type.Object && ((cast(MacroPrototype) f._payload._object) !is null));
 		var[] args;
@@ -1486,8 +1658,9 @@ class CallExpression : Expression {
 		var _this;
 		if(auto dve = cast(DotVarExpression) func) {
 			_this = dve.e1.interpret(sc).value;
-		} else if(auto ide = cast(IndexExpression) func)
+		} else if(auto ide = cast(IndexExpression) func) {
 			_this = ide.interpret(sc).value;
+		}
 
 		return InterpretResult(f.apply(_this, args), sc);
 	}
@@ -1530,7 +1703,14 @@ Expression parsePart(MyTokenStreamHere)(ref MyTokenStreamHere tokens) {
 		Expression e;
 		if(token.type == ScriptToken.Type.identifier)
 			e = parseVariableName(tokens);
-		else {
+		else if(token.type == ScriptToken.Type.symbol && (token.str == "-" || token.str == "+")) {
+			auto op = token.str;
+			tokens.popFront();
+
+			e = parsePart(tokens);
+			if(op == "-")
+				e = new NegationExpression(e);
+		} else {
 			tokens.popFront();
 
 			if(token.type == ScriptToken.Type.int_number)
@@ -2209,6 +2389,13 @@ Expression parseStatement(MyTokenStreamHere)(ref MyTokenStreamHere tokens, strin
 		case ScriptToken.Type.keyword:
 		case ScriptToken.Type.symbol:
 			switch(token.str) {
+				// assert
+				case "assert":
+					tokens.popFront();
+
+					return parseFunctionCall(tokens, new AssertKeyword(token));
+
+				break;
 				// declarations
 				case "var":
 					return parseVariableDeclaration(tokens, ";");
@@ -2424,18 +2611,57 @@ var interpret(string code, PrototypeObject variables, string scriptFilename = nu
 	return interpretStream(lexScript(repeat(code, 1), scriptFilename), variables);
 }
 
+/++
+	This is likely your main entry point to the interpreter. It will interpret the script code
+	given, with the given global variable object (which will be modified by the script, meaning
+	you can pass it to subsequent calls to `interpret` to store context), and return the result
+	of the last expression given.
+
+	---
+	var globals = var.emptyObject; // the global object must be an object of some type
+	globals.x = 10;
+	globals.y = 15;
+	// you can also set global functions through this same style, etc
+
+	var result = interpret(`x + y`, globals);
+	assert(result == 25);
+	---
+
+
+	$(TIP
+		If you want to just call a script function, interpret the definition of it,
+		then just call it through the `globals` object you passed to it.
+
+		---
+		var globals = var.emptyObject;
+		interpret(`function foo(name) { return "hello, " ~ name ~ "!"; }`, globals);
+		var result = globals.foo()("world");
+		assert(result == "hello, world!");
+		---
+	)
+
+	Params:
+		code = the script source code you want to interpret
+		scriptFilename = the filename of the script, if you want to provide it. Gives nicer error messages if you provide one.
+		variables = The global object of the script context. It will be modified by the user script.
+
+	Returns:
+		the result of the last expression evaluated by the script engine
++/
 var interpret(string code, var variables = null, string scriptFilename = null) {
 	return interpretStream(
 		lexScript(repeat(code, 1), scriptFilename),
 		(variables.payloadType() == var.Type.Object && variables._payload._object !is null) ? variables._payload._object : new PrototypeObject());
 }
 
+///
 var interpretFile(File file, var globals) {
 	import std.algorithm;
 	return interpretStream(lexScript(file.byLine.map!((a) => a.idup), file.name),
 		(globals.payloadType() == var.Type.Object && globals._payload._object !is null) ? globals._payload._object : new PrototypeObject());
 }
 
+///
 void repl(var globals) {
 	import std.stdio;
 	import std.algorithm;
